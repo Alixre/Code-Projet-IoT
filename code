@@ -1,0 +1,125 @@
+// Bibliothèques utilisées
+#include "Arduino.h"
+#include "PubSubClient.h"
+#include "WiFi.h"
+#include "HX711.h"
+#include "esp_wpa2.h" // Librairie wpa2 pour se connecter au réseau d'une entreprise
+
+// Identifiants numériques au sein de l'organisation
+#define EAP_IDENTITY "identifiant"
+#define EAP_PASSWORD "motdepasse" // mot de passe EDUROAM
+#define EAP_USERNAME "identifiant"
+
+// SSID
+const char* ssid = "eduroam";
+
+#define CONNECTION_TIMEOUT 10
+int timeout_counter = 0;
+
+// Fonction permettant de récupérer les informations associées au réseau. On les affiche sur le moniteur série
+void get_network_info(){
+    if(WiFi.status() == WL_CONNECTED) {
+        Serial.print("[*] Informations - SSID : ");
+        Serial.println(ssid);
+        Serial.println((String)"[+] RSSI : " + WiFi.RSSI() + " dB");
+    }
+}
+
+// Informations pour la connexion au broker MQTT
+const char* mqtt_server = "147.94.241.100"; // Adresse IP ou URL du broker
+const int mqtt_port = 1883; // Port MQTT, par défaut 1883
+const char* mqtt_topic = "balance"; // Topic MQTT
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// HX711 circuit wiring
+const int LOADCELL_DOUT_PIN = 26;
+const int LOADCELL_SCK_PIN = 27;
+const int Calibration_Weight = 50; // Poids de calibration en grammes
+
+HX711 scale;
+
+// Fonction pour se connecter au broker MQTT
+void reconnect() {
+    while (!client.connected()) {
+        Serial.print("Connexion au broker MQTT...");
+        // Tentative de connexion
+        if (client.connect("ArduinoClient")) {
+            Serial.println("connecté");
+        } else {
+            Serial.print("Échec, rc=");
+            Serial.print(client.state());
+            Serial.println("; nouvelle tentative dans 5 secondes.");
+            delay(5000); // Attendre 5 secondes avant de réessayer
+        }
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+      // Initialisation Wifi
+    delay(10);
+    Serial.print(F("Connexion au réseau : "));
+    Serial.println(ssid);
+    WiFi.disconnect(true);
+    delay(500);
+    WiFi.begin(ssid, WPA2_AUTH_PEAP, EAP_IDENTITY, EAP_USERNAME, EAP_PASSWORD);
+    delay(500);
+    while(WiFi.status() != WL_CONNECTED) {
+        Serial.print(".");
+        delay(200);
+        timeout_counter++;
+        if(timeout_counter >= CONNECTION_TIMEOUT * 5) {
+            ESP.restart();
+        }
+    }
+    Serial.println("");
+    Serial.println(F("Connecté au réseau WiFi."));
+    get_network_info();
+
+    // Configuration du client MQTT
+    client.setServer(mqtt_server, mqtt_port);
+
+    // Initialisation balance (calibration)
+    scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+    scale.set_scale();
+    scale.tare();
+    delay(3000);
+    Serial.println("Calibration imminente");
+    Serial.println("Posez la masse de 50g à l'extrémité de la balance");
+    delay(9000);
+
+    float x = scale.get_units(10);
+    x = x / Calibration_Weight; // Ajuste l'échelle
+    scale.set_scale(x);
+    Serial.println("Calibration finie, enlevez la masse");
+    delay(3000);
+}
+
+void loop() {
+    if (!client.connected()) {
+        reconnect();
+    }
+    client.loop(); // Garder la connexion MQTT active
+
+    if (scale.is_ready()) {
+        float reading = scale.get_units(10);
+        Serial.print("HX711 reading: ");
+        Serial.print(reading);
+        Serial.println(" g");
+
+        // Publication des données via MQTT
+        char msg[50];
+        snprintf(msg, 50, "%f", reading);
+        if (client.publish(mqtt_topic, msg)) {
+            Serial.println("Données envoyées avec succès au broker MQTT.");
+        } else {
+            Serial.println("Échec de l'envoi des données au broker MQTT.");
+        }
+    } else {
+        Serial.println("HX711 not found. Retrying...");
+        delay(500); // Délai avant de réessayer
+    }
+    delay(1000); // Délai entre les lectures
+}
